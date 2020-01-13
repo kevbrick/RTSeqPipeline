@@ -4,15 +4,13 @@
 ========================================================================================
                RDCO LAB ORI-SEQ PIPELINE
 ========================================================================================
- Initialized; January 2017.
+ Initialized; January 2018.
  # Authors ; Kevin Brick <kevin.brick@nih.gov>
- #
- # NOTE: Modified from NGI-RNA-Seq pipeline
- ----------------------------------------------------------------------------------------
+  ----------------------------------------------------------------------------------------
 */
 
 // Pipeline version
-version = '2.0'
+version = '1.4'
 
 def helpMessage() {
     log.info"""
@@ -23,12 +21,12 @@ def helpMessage() {
     nextflow run $PIPEPATH/rtSeq --bam  <BAM file> --genome <mm10|hg38> --type <SR|PE> --name <XX> --od <ZZ>
 
     Mandatory arguments:
-      --sra                         SRA object name
-      --obj                         Object store file name
       --bam                         Path to input bam file
       --genome                      Name of genome reference (mm10|hg38|canFam3 are the ONLY options)
+      --gcCorrectionFile            GC calibration file (choose one from accessoryFiles/gcCalibration)
+                                    If omitted, pipeline will generate a calibration file from the BAM
+                                    provided. This is a time-consuming step.
       --name                        Output name
-      --skipAlignment               Skip alignment step
       --outdir                      The output directory
       --yeast                       adapt pipeline for tiiiny yeast genome
     """.stripIndent()
@@ -56,36 +54,26 @@ try {
               "============================================================"
 }
 
+// END CHECKS
 //number of threads
-params.threads          = 12
-params.mem              = "16G"
-params.bwa_args         = ""
-params.sra              = ""
-params.obj              = ""
 params.bam              = ""
-params.fq1              = ""
-params.fq2              = ""
-params.name             = ""
-params.skipAlignment    = false
-params.skipMPU          = false
+params.genome           = ""
+params.gcCorrectionFile = ""
+params.name             = "RTseqPipelineOUT"
+params.outdir           = "."
+
+params.gcBiasType       = ""
 params.test             = false
 params.fullChromTest    = false
 params.debug            = false
 params.yeast            = false
-params.hiseqx           = false
-params.gcCorrectionFile = ""
-params.gcBiasType       = ""
 
-//genome version
-params.genome_fasta     = "$GENOMES/${params.genome}/BWAIndex/version0.7.10/genome.fa"
-params.genome_IDX       = "$GENOMES/${params.genome}/BWAIndex/version0.7.10/genome.fa.fai"
-params.genome_folder    = "$GENOMES/${params.genome}/"
 params.accessoryDir     = "$NXF_PIPEDIR/accessoryFiles/rtSeq"
 params.codeRdir         = "${params.accessoryDir}/scripts/R"
 params.rtData           = "${params.accessoryDir}/${params.genome}"
+params.genome_IDX       = "${params.rtData}/idx/genome.fa.fai"
 params.genome_mask_fa   = "${params.rtData}/genomeMASK/genome.fa"
 params.pseudoReadBase   = "${params.rtData}/pseudoreads/"
-params.outdir           = "."
 params.outBG            = "${params.outdir}/bedgraph"
 params.outImg           = "${params.outdir}/img"
 params.outTable         = "${params.outdir}/tables"
@@ -124,33 +112,17 @@ if( params.test ){
 }
 
 def inputType
-if (params.sra){inputType = 'sra'}
-if (params.obj){inputType = 'obj'}
 
 if (params.bam){
   inputType = 'bam'
   bamIn = file(params.bam)
 }
 
-if (params.fq1){
-  inputType = 'fastqSR'
-  fq1In = file(params.fq1)
-}
-
-if (params.fq2){
-  inputType = 'fastqPE'
-  fq2In = file(params.fq2)
-}
-
 def oname
 if (params.name){
   oname           = "${params.name}.RTseq"
 }else{
-  if (params.sra){oname = "${params.sra}.RTseq"}
-  if (params.obj){oname = "${params.obj}.RTseq"}
   if (params.bam){oname = params.bam.replaceFirst(".bam",".RTseq")}
-  if (params.fq1){oname = params.fq1.replaceFirst(".fastq.*",".RTseq")}
-  if (params.fq2){oname = params.fq1.replaceFirst(".fastq.*",".RTseq")}
 }
 
 if (params.gcCorrectionFile){
@@ -169,23 +141,15 @@ def tmpName = "${outname}.tmprtSeq.${params.genome}"
 
 //Show params
 log.info "==========================================================================================================================================="
-log.info "rtSeq PIPELINE :              "
+log.info "RT-Seq pipeline :              "
 log.info "==========================================================================================================================================="
-log.info "ref genome         : ${params.genome}"
-log.info "genome fasta       : ${params.genome_fasta}"
-log.info "sra                : ${params.sra}"
-log.info "obj                : ${params.obj}"
 log.info "bam                : ${params.bam}"
-log.info "fq1                : ${params.fq1}"
-log.info "fq2                : ${params.fq2}"
-log.info "input type         : ${inputType}"
+log.info "genome             : ${params.genome}"
+log.info "GC Correction File : ${params.gcCorrectionFile}"
 log.info "outName            : ${outName}"
 log.info "outdir             : ${params.outdir}"
 log.info "temp_dir           : ${params.outdir_tmp}"
-log.info "threads            : ${params.threads}"
-log.info "mem                : ${params.mem}"
 log.info "using Yeast?       : ${params.yeast}"
-log.info "GC correction file : ${params.gcCorrectionFile}"
 log.info "==========================================================================================================================================="
 
 def getIDX( file ) {
@@ -193,258 +157,193 @@ def getIDX( file ) {
    return nm.replaceFirst(/.bam$/,".bam.bai")
  }
 
-//Skip alignment
-if (params.skipAlignment){
-  //Create Ab8580 input channels
-  Channel
-       .fromPath(params.bam)
-       .ifEmpty { exit 1, "BAM file not found" }
-       .map { sample -> tuple(file(getIDX(sample)), sample) }
-       .into {initBAM; initBAM2}
-
- }else{
-  process align{
-  	scratch '/lscratch/$SLURM_JOBID'
-    clusterOptions ' --gres=lscratch:800 --partition=norm'
-
-    echo true
-    cpus 8
-    memory '32g'
-
-    time { 8.hour * task.attempt}
-    errorStrategy { 'retry' }
-    maxRetries 3
-
-    module 'nextflow/0.30.2'
-    module 'picard/2.9.2'
-
-    publishDir params.outdir, mode: 'copy', overwrite: false, pattern: "*bam"
-    publishDir params.outdir, mode: 'copy', overwrite: false, pattern: "*bai"
-
-    output:
-    set file("*.bai"), file("*.bam") into (initBAM, initBAM2)
-
-    script:
-      switch (inputType) {
-        case 'sra':
-          """
-          nextflow run -c \$NXF_PIPEDIR/nextflow.local.config \$NXF_PIPEDIR/genericAligner.V1.2.groovy \
-                       --genome ${params.genome} --sra ${params.sra} --aligner bwa --outdir . --name ${outName} --justAlign
-          """
-        break
-
-        case 'obj':
-          """
-          nextflow run -c \$NXF_PIPEDIR/nextflow.local.config \$NXF_PIPEDIR/genericAligner.V1.2.groovy \
-                       --genome ${params.genome} --obj ${params.obj} --aligner bwa --outdir . --name ${outName} --justAlign
-          """
-        break
-
-        case 'bam':
-          """
-          nextflow run -c \$NXF_PIPEDIR/nextflow.local.config \$NXF_PIPEDIR/genericAligner.V1.2.groovy \
-                       --genome ${params.genome} --bam ${bamIn} --aligner bwa --outdir . --name ${outName} --justAlign
-          """
-        break
-
-        case 'fastqSR':
-          """
-          nextflow run -c \$NXF_PIPEDIR/nextflow.local.config \$NXF_PIPEDIR/genericAligner.V1.2.groovy \
-                       --genome ${params.genome} --fq1 ${fq1In} --aligner bwa --outdir . --name ${outName} --justAlign
-          """
-        break
-
-        case 'fastqPE':
-          """
-          nextflow run -c \$NXF_PIPEDIR/nextflow.local.config \$NXF_PIPEDIR/genericAligner.V1.2.groovy \
-                       --genome ${params.genome} --fq1 ${fq1In} --fq2 ${fq2In} --aligner bwa --outdir . --name ${outName} --justAlign
-          """
-        break
-      }
-    }
-  }
+Channel
+     .fromPath(params.bam)
+     .ifEmpty { exit 1, "BAM file not found" }
+     .map { sample -> tuple(file(getIDX(sample)), sample) }
+     .into {initBAM; initBAM2}
 
 if (params.gcCorrectionFile){
   Channel
-       .fromPath(params.gcCorrectionFile)
-       .ifEmpty { exit 1, "Bias correction stat file not found" }
-       .set {correctionTab}
+    .fromPath(params.gcCorrectionFile)
+    .ifEmpty { exit 1, "Bias correction stat file not found" }
+    .set {correctionTab}
 
-       process getCoverage {
-         scratch '/lscratch/$SLURM_JOBID'
-         clusterOptions ' --gres=lscratch:300 --partition=norm'
+    process getCoverage {
+      scratch '/lscratch/$SLURM_JOBID'
+      clusterOptions ' --gres=lscratch:300 --partition=norm'
 
-         echo true
-         cpus 2
+      echo true
+      cpus 2
 
-         memory '32 GB'
-         module 'picard/2.9.2'
-         module 'bedtools/2.27.1'
-         module 'samtools/1.9'
+      memory '32 GB'
+      module 'picard/2.9.2'
+      module 'bedtools/2.27.1'
+      module 'samtools/1.9'
 
-         time { 3.hour * task.attempt}
+      time { 3.hour * task.attempt}
 
-         errorStrategy { 'retry' }
-         maxRetries 3
+      errorStrategy { 'retry' }
+      maxRetries 3
 
-         tag { chrom }
+      tag { chrom }
 
-         //publishDir params.outdir,  mode: 'copy', overwrite: false
+      //publishDir params.outdir,  mode: 'copy', overwrite: false
 
-         input:
-         set file(bai), file(bam) from initBAM
-         each chrom from chromNames
-         file gctab from correctionTab
+      input:
+      set file(bai), file(bam) from initBAM
+      each chrom from chromNames
+      file gctab from correctionTab
 
-         output:
-         file "*.w*0k.bedgraph" into csBG
-         file "*.GCdata.tab"    into csGCdata
+      output:
+      file "*.w*0k.bedgraph" into csBG
+      file "*.GCdata.tab"    into csGCdata
 
-         script:
+      script:
 
-         """
-         tbam="${chrom}.tmp.bam"
-         s1bam="${chrom}.s1.bam"
-         s2bam="${chrom}.s2.bam"
-         s3bam="${chrom}.s3.bam"
-         s4bam="${chrom}.s4.bam"
-         cbam="${chrom}.bam"
+      """
+      tbam="${chrom}.tmp.bam"
+      s1bam="${chrom}.s1.bam"
+      s2bam="${chrom}.s2.bam"
+      s3bam="${chrom}.s3.bam"
+      s4bam="${chrom}.s4.bam"
+      cbam="${chrom}.bam"
 
-         samtools view -hb -q 30 ${bam} ${chrom} >\$tbam
-         samtools index \$tbam
+      samtools view -hb -q 30 ${bam} ${chrom} >\$tbam
+      samtools index \$tbam
 
-         java -jar \$PICARDJAR SortSam I=\$tbam O=\$s1bam VALIDATION_STRINGENCY=LENIENT SO=queryname TMP_DIR=/lscratch/\$SLURM_JOBID
+      java -jar \$PICARDJAR SortSam I=\$tbam O=\$s1bam VALIDATION_STRINGENCY=LENIENT SO=queryname TMP_DIR=/lscratch/\$SLURM_JOBID
 
-         nPE=`samtools view -h \$tbam |head -n 100000 |samtools view -c -f 1 -S /dev/stdin`
+      nPE=`samtools view -h \$tbam |head -n 100000 |samtools view -c -f 1 -S /dev/stdin`
 
-         if [ "\$nPE" -eq "0" ]; then
-           ln -s \$s1bam \$s3bam
-         else
-           java -jar \$PICARDJAR FixMateInformation I=\$s1bam O=\$s2bam VALIDATION_STRINGENCY=LENIENT SO=queryname AS=true TMP_DIR=/lscratch/\$SLURM_JOBID
-           samtools view -hb -f 2 \$s2bam >\$s3bam
-         fi
+      if [ "\$nPE" -eq "0" ]; then
+        ln -s \$s1bam \$s3bam
+      else
+        java -jar \$PICARDJAR FixMateInformation I=\$s1bam O=\$s2bam VALIDATION_STRINGENCY=LENIENT SO=queryname AS=true TMP_DIR=/lscratch/\$SLURM_JOBID
+        samtools view -hb -f 2 \$s2bam >\$s3bam
+      fi
 
-         java -jar \$PICARDJAR MarkDuplicates I=\$s3bam O=\$s4bam VALIDATION_STRINGENCY=LENIENT REMOVE_DUPLICATES=true M=metrics.tab TMP_DIR=/lscratch/\$SLURM_JOBID
-         java -jar \$PICARDJAR SortSam I=\$s4bam O=\$cbam VALIDATION_STRINGENCY=LENIENT SO=coordinate TMP_DIR=/lscratch/\$SLURM_JOBID
-         samtools index \$cbam
+      java -jar \$PICARDJAR MarkDuplicates I=\$s3bam O=\$s4bam VALIDATION_STRINGENCY=LENIENT REMOVE_DUPLICATES=true M=metrics.tab TMP_DIR=/lscratch/\$SLURM_JOBID
+      java -jar \$PICARDJAR SortSam I=\$s4bam O=\$cbam VALIDATION_STRINGENCY=LENIENT SO=coordinate TMP_DIR=/lscratch/\$SLURM_JOBID
+      samtools index \$cbam
 
-         #rm -f *.s?.bam
+      #rm -f *.s?.bam
 
-         readLen=`perl ${params.accessoryDir}/scripts/getClosestReadLength.pl \$tbam 50,150`
-         win101="${params.rtData}/genomewin/${chrom}.win101.bed"
-         ps101="${params.rtData}/genomewin/${chrom}.psr"\$readLen".tab"
-         gc101="${params.rtData}/genomewin/${chrom}.win101.GC.tab"
+      readLen=`perl ${params.accessoryDir}/scripts/getClosestReadLength.pl \$tbam 50,150`
+      win101="${params.rtData}/genomewin/${chrom}.win101.bed"
+      ps101="${params.rtData}/genomewin/${chrom}.psr"\$readLen".tab"
+      gc101="${params.rtData}/genomewin/${chrom}.win101.GC.tab"
 
-         grep -w ${chrom} ${params.genome_IDX} >idx.fai
+      grep -w ${chrom} ${params.genome_IDX} >idx.fai
 
-         intersectBed -a \$win101 -b \$cbam -c -sorted -g ${params.genome_IDX} |perl -pi -e 's/\\./0/g' >${chrom}.cover.tab
+      intersectBed -a \$win101 -b \$cbam -c -sorted -g ${params.genome_IDX} |perl -pi -e 's/\\./0/g' >${chrom}.cover.tab
 
-         paste ${chrom}.cover.tab \$ps101 \$gc101 >${chrom}.tab
+      paste ${chrom}.cover.tab \$ps101 \$gc101 >${chrom}.tab
 
-         ## DO GC NORMALIZATION
-         expectedSim=`echo \$readLen + 100 |bc`
-         mapabilityLowerLim=`echo "(\$readLen + 100)*0.66" |bc`
-         mapabilityUpperLim=`echo "(\$readLen + 100)*1.2" |bc`
+      ## DO GC NORMALIZATION
+      expectedSim=`echo \$readLen + 100 |bc`
+      mapabilityLowerLim=`echo "(\$readLen + 100)*0.66" |bc`
+      mapabilityUpperLim=`echo "(\$readLen + 100)*1.2" |bc`
 
-         perl ${params.accessoryDir}/scripts/normalizeBy2NGC.pl ${gctab} ${chrom}.tab \$expectedSim
+      perl ${params.accessoryDir}/scripts/normalizeBy2NGC.pl ${gctab} ${chrom}.tab \$expectedSim
 
-         shuf GCData.tab |head -n 1000000 |sort -k1rn,1rn >${chrom}.GCdata.tab
+      shuf GCData.tab |head -n 1000000 |sort -k1rn,1rn >${chrom}.GCdata.tab
 
-         perl -lane 'print join("\\t",@F[0..2],\$F[4]) if (\$F[4] > '\$mapabilityLowerLim' && \$F[4] <  '\$mapabilityUpperLim' )' ${chrom}.tab >${chrom}.mapability.tab
+      perl -lane 'print join("\\t",@F[0..2],\$F[4]) if (\$F[4] > '\$mapabilityLowerLim' && \$F[4] <  '\$mapabilityUpperLim' )' ${chrom}.tab >${chrom}.mapability.tab
 
-         bedtools makewindows -g idx.fai -w 500000 -s 50000  | perl -lane \'print join("\\t",@F) unless ((\$F[2]-\$F[1]) != 500000)\' >win500k50k.init.bed
-         bedtools makewindows -g idx.fai -w 500000 -s 100000 | perl -lane \'print join("\\t",@F) unless ((\$F[2]-\$F[1]) != 500000)\' >win500k100k.init.bed
+      bedtools makewindows -g idx.fai -w 500000 -s 50000  | perl -lane \'print join("\\t",@F) unless ((\$F[2]-\$F[1]) != 500000)\' >win500k50k.init.bed
+      bedtools makewindows -g idx.fai -w 500000 -s 100000 | perl -lane \'print join("\\t",@F) unless ((\$F[2]-\$F[1]) != 500000)\' >win500k100k.init.bed
 
-         mapBed -a win500k50k.init.bed  -b ${chrom}.mapability.tab -c 4 -o count |perl -lane 'print join("\\t",@F[0..2]) if (\$F[3] > 330000)' >win500k50k.bed
-         mapBed -a win500k100k.init.bed -b ${chrom}.mapability.tab -c 4 -o count |perl -lane 'print join("\\t",@F[0..2]) if (\$F[3] > 330000)' >win500k100k.bed
+      mapBed -a win500k50k.init.bed  -b ${chrom}.mapability.tab -c 4 -o count |perl -lane 'print join("\\t",@F[0..2]) if (\$F[3] > 330000)' >win500k50k.bed
+      mapBed -a win500k100k.init.bed -b ${chrom}.mapability.tab -c 4 -o count |perl -lane 'print join("\\t",@F[0..2]) if (\$F[3] > 330000)' >win500k100k.bed
 
-         mapBed -a win500k50k.bed  -b ${chrom}.GCcorrected.bedgraph -c 4,4 -o sum,count |perl -M"Math::Round" -lane '\$F[3] = 0 if (\$F[3] eq "." );  \$val=\$F[4]?\$F[3]/\$F[4]:0; print join("\\t",\$F[0],\$F[1]+250000-25000,\$F[1]+250000+24999,round(\$val*100)/100) if (\$val)' >${chrom}.win500k50k.tmp
-         mapBed -a win500k100k.bed -b ${chrom}.GCcorrected.bedgraph -c 4,4 -o sum,count |perl -M"Math::Round" -lane '\$F[3] = 0 if (\$F[3] eq "." );  \$val=\$F[4]?\$F[3]/\$F[4]:0; print join("\\t",\$F[0],\$F[1]+250000-50000,\$F[1]+250000+49999,round(\$val*100)/100) if (\$val)' >${chrom}.win500k100k.tmp
+      mapBed -a win500k50k.bed  -b ${chrom}.GCcorrected.bedgraph -c 4,4 -o sum,count |perl -M"Math::Round" -lane '\$F[3] = 0 if (\$F[3] eq "." );  \$val=\$F[4]?\$F[3]/\$F[4]:0; print join("\\t",\$F[0],\$F[1]+250000-25000,\$F[1]+250000+24999,round(\$val*100)/100) if (\$val)' >${chrom}.win500k50k.tmp
+      mapBed -a win500k100k.bed -b ${chrom}.GCcorrected.bedgraph -c 4,4 -o sum,count |perl -M"Math::Round" -lane '\$F[3] = 0 if (\$F[3] eq "." );  \$val=\$F[4]?\$F[3]/\$F[4]:0; print join("\\t",\$F[0],\$F[1]+250000-50000,\$F[1]+250000+49999,round(\$val*100)/100) if (\$val)' >${chrom}.win500k100k.tmp
 
-         intersectBed -c -sorted -a ${chrom}.win500k50k.tmp  -b ${params.rtData}/blacklist/${params.genome}.blacklist.bed  >${chrom}.w500ks50k.bedgraph
-         intersectBed -c -sorted -a ${chrom}.win500k100k.tmp -b ${params.rtData}/blacklist/${params.genome}.blacklist.bed  >${chrom}.w500ks100k.bedgraph
-         """
-         }
+      intersectBed -c -sorted -a ${chrom}.win500k50k.tmp  -b ${params.rtData}/blacklist/${params.genome}.blacklist.bed  >${chrom}.w500ks50k.bedgraph
+      intersectBed -c -sorted -a ${chrom}.win500k100k.tmp -b ${params.rtData}/blacklist/${params.genome}.blacklist.bed  >${chrom}.w500ks100k.bedgraph
+      """
+      }
 
-       process mergeCBGs {
-         scratch '/lscratch/$SLURM_JOBID'
-         clusterOptions ' --gres=lscratch:300 --partition=norm'
+    process mergeCBGs {
+      scratch '/lscratch/$SLURM_JOBID'
+      clusterOptions ' --gres=lscratch:300 --partition=norm'
 
-         echo true
-         cpus 2
+      echo true
+      cpus 2
 
-         memory '16 GB'
-         module 'bedtools/2.27.1'
-         module 'R/3.5.2'
+      memory '16 GB'
+      module 'bedtools/2.27.1'
+      module 'R/3.5.2'
 
-         time '2h'
+      time '2h'
 
-         errorStrategy { 'retry' }
-         maxRetries 1
+      errorStrategy { 'retry' }
+      maxRetries 1
 
-         publishDir params.outBG,  mode: 'copy', overwrite: true, pattern: '*bedgraph'
-         publishDir params.outImg, mode: 'copy', overwrite: true, pattern: '*pdf'
-         publishDir params.outImg, mode: 'copy', overwrite: true, pattern: '*png'
+      publishDir params.outBG,  mode: 'copy', overwrite: true, pattern: '*bedgraph'
+      publishDir params.outImg, mode: 'copy', overwrite: true, pattern: '*pdf'
+      publishDir params.outImg, mode: 'copy', overwrite: true, pattern: '*png'
 
-         input:
-         file(gc) from csGCdata.collect()
-         file(bg) from csBG.collect()
+      input:
+      file(gc) from csGCdata.collect()
+      file(bg) from csBG.collect()
 
-         output:
-         file "*norm*.bedgraph"    into allBGs
-         file "*coverage.bedgraph" into coverBG
-         file "*png" into coverPNG
-         file "*pdf" into coverPDF
+      output:
+      file "*norm*.bedgraph"    into allBGs
+      file "*coverage.bedgraph" into coverBG
+      file "*png" into coverPNG
+      file "*pdf" into coverPDF
 
-         script:
-         """
-         cat *.GCdata.tab |shuf -n 2000000 >GCdata.tab
+      script:
+      """
+      cat *.GCdata.tab |shuf -n 2000000 >GCdata.tab
 
-         R --vanilla <${params.accessoryDir}/scripts/R/plotGCcorrectionStats.R
-         mv gcCorrection.png ${outName}.gcCorrection.png
-         mv gcCorrection.pdf ${outName}.gcCorrection.pdf
+      R --vanilla <${params.accessoryDir}/scripts/R/plotGCcorrectionStats.R
+      mv gcCorrection.png ${outName}.gcCorrection.png
+      mv gcCorrection.pdf ${outName}.gcCorrection.pdf
 
-         for step in 50 100; do
-           sort -k1,1 -k2n,2n *".w500ks"\$step"k.bedgraph"  |perl -lane \'\$F[3] = 0 if (\$F[4]); print join("\\t",@F[0..3])\' >"${outName}.w500ks"\$step"k.coverage.bedgraph"
-           perl ${params.accessoryDir}/scripts/normalizeBedgraph.pl "${outName}.w500ks"\$step"k.coverage.bedgraph" "${outName}.w500ks"\$step"k"
+      for step in 50 100; do
+        sort -k1,1 -k2n,2n *".w500ks"\$step"k.bedgraph"  |perl -lane \'\$F[3] = 0 if (\$F[4]); print join("\\t",@F[0..3])\' >"${outName}.w500ks"\$step"k.coverage.bedgraph"
+        perl ${params.accessoryDir}/scripts/normalizeBedgraph.pl "${outName}.w500ks"\$step"k.coverage.bedgraph" "${outName}.w500ks"\$step"k"
 
-           mv "${outName}.w500ks"\$step"k.normByGenomeMean.penultimateBG"    "${outName}.w500ks"\$step"k.normByGenomeMean.bedgraph"
-           mv "${outName}.w500ks"\$step"k.normByGenomeMedian.penultimateBG"  "${outName}.w500ks"\$step"k.normByGenomeMedian.bedgraph"
-           mv "${outName}.w500ks"\$step"k.normByChromMean.penultimateBG"     "${outName}.w500ks"\$step"k.normByChromMean.bedgraph"
-           mv "${outName}.w500ks"\$step"k.normByChromMedian.penultimateBG"   "${outName}.w500ks"\$step"k.normByChromMedian.bedgraph"
+        mv "${outName}.w500ks"\$step"k.normByGenomeMean.penultimateBG"    "${outName}.w500ks"\$step"k.normByGenomeMean.bedgraph"
+        mv "${outName}.w500ks"\$step"k.normByGenomeMedian.penultimateBG"  "${outName}.w500ks"\$step"k.normByGenomeMedian.bedgraph"
+        mv "${outName}.w500ks"\$step"k.normByChromMean.penultimateBG"     "${outName}.w500ks"\$step"k.normByChromMean.bedgraph"
+        mv "${outName}.w500ks"\$step"k.normByChromMedian.penultimateBG"   "${outName}.w500ks"\$step"k.normByChromMedian.bedgraph"
 
-           perl ${params.accessoryDir}/scripts/convertToModellingBG.pl "${outName}.w500ks"\$step"k.normByGenomeMean.bedgraph"   ${params.genome_IDX} >"${outName}.w500ks"\$step"k.normByGenomeMean.forModel.bedgraph"
-           perl ${params.accessoryDir}/scripts/convertToModellingBG.pl "${outName}.w500ks"\$step"k.normByGenomeMedian.bedgraph" ${params.genome_IDX} >"${outName}.w500ks"\$step"k.normByGenomeMedian.forModel.bedgraph"
-           perl ${params.accessoryDir}/scripts/convertToModellingBG.pl "${outName}.w500ks"\$step"k.normByChromMean.bedgraph"    ${params.genome_IDX} >"${outName}.w500ks"\$step"k.normByChromMean.forModel.bedgraph"
-           perl ${params.accessoryDir}/scripts/convertToModellingBG.pl "${outName}.w500ks"\$step"k.normByChromMedian.bedgraph"  ${params.genome_IDX} >"${outName}.w500ks"\$step"k.normByChromMedian.forModel.bedgraph"
-         done
-         """
-          }
+        perl ${params.accessoryDir}/scripts/convertToModellingBG.pl "${outName}.w500ks"\$step"k.normByGenomeMean.bedgraph"   ${params.genome_IDX} >"${outName}.w500ks"\$step"k.normByGenomeMean.forModel.bedgraph"
+        perl ${params.accessoryDir}/scripts/convertToModellingBG.pl "${outName}.w500ks"\$step"k.normByGenomeMedian.bedgraph" ${params.genome_IDX} >"${outName}.w500ks"\$step"k.normByGenomeMedian.forModel.bedgraph"
+        perl ${params.accessoryDir}/scripts/convertToModellingBG.pl "${outName}.w500ks"\$step"k.normByChromMean.bedgraph"    ${params.genome_IDX} >"${outName}.w500ks"\$step"k.normByChromMean.forModel.bedgraph"
+        perl ${params.accessoryDir}/scripts/convertToModellingBG.pl "${outName}.w500ks"\$step"k.normByChromMedian.bedgraph"  ${params.genome_IDX} >"${outName}.w500ks"\$step"k.normByChromMedian.forModel.bedgraph"
+      done
+      """
+      }
 
-      if (params.debug){
-        process dieNowV2 {
-          scratch '/lscratch/$SLURM_JOBID'
-          clusterOptions ' --gres=lscratch:300 --partition=norm'
+    if (params.debug){
+      process dieNowV2 {
+        scratch '/lscratch/$SLURM_JOBID'
+        clusterOptions ' --gres=lscratch:300 --partition=norm'
 
-          echo true
-          cpus 1
+        echo true
+        cpus 1
 
-          memory '1 GB'
-          module 'picard/2.9.2'
-          module 'bedtools/2.27.1'
+        memory '1 GB'
+        module 'picard/2.9.2'
+        module 'bedtools/2.27.1'
 
-          time '1h'
+        time '1h'
 
-          input:
-          file(gc2) from allBGs.collect()
+        input:
+        file(gc2) from allBGs.collect()
 
-          output:
+        output:
 
-          script:
-          """
-          froopfroop ! ! ! die my friend !!
-          """
-         }
+        script:
+        """
+        froopfroop ! ! ! die my friend !!
+        """
+        }
       }
 }else{
   process generateMpileup {
