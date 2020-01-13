@@ -14,7 +14,7 @@ arg                | required | detail
 ------------------ | -------- | --------------------------------
 --bam              | *        | BWA aligned BAM file
 --genome           | *        | Genome name (mm10 / hg38)
---gcCorrectionFile | *        | GC calibration file (choose one from accessoryFiles/gcCalibration)
+--gcCorrectionFile | *        | GC calibration file (choose one from accessoryFiles/rtSeq/gcCalibration)
 ..                 |          | If omitted, pipeline will generate a calibration file from the BAM
 ..                 |          | provided. This is a time-consuming step. 
 --name             | *        | Output file name stem
